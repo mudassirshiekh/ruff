@@ -4135,7 +4135,52 @@ impl<'db> Class<'db> {
 
         // TODO: The symbol is not present in any class body, but it could be implicitly
         // defined in `__init__` or other methods anywhere in the MRO.
-        todo_type!("implicit instance attribute").into()
+        SymbolAndQualifiers(Symbol::Unbound, TypeQualifiers::empty())
+    }
+
+    /// Tries to find declarations/bindings of an instance attribute named `name` that are
+    /// only "implicitly" defined in a method of the class that corresponds to `body_scope`.
+    fn implicit_instance_attribute(
+        db: &'db dyn Db,
+        class_body_scope: ScopeId<'db>,
+        name: &str,
+    ) -> Option<Type<'db>> {
+        let index = semantic_index(db, class_body_scope.file(db));
+        let mut union_of_inferred_types = UnionBuilder::new(db).add(Type::unknown());
+
+        for attribute_assignment in index.attribute_assignments(db, class_body_scope, name)? {
+            if let Some(annotation_expr) = attribute_assignment.annotation(db) {
+                // We found an annotated assignment of one of the following forms (using 'self' in these
+                // examples, but we support arbitrary names for the first parameters of methods):
+                //
+                //     self.name: type
+                //     self.name: type = <expr>
+
+                let inference = infer_expression_types(db, annotation_expr);
+                let expr_scope = annotation_expr.scope(db);
+                let annotation_ty = inference.expression_type(
+                    annotation_expr
+                        .node_ref(db)
+                        .scoped_expression_id(db, expr_scope),
+                );
+
+                // TODO: check if there are conflicting declarations
+                return Some(annotation_ty);
+            } else if let Some(value_expr) = attribute_assignment.value(db) {
+                // We found an assignment of the form:
+                //
+                //     self.name = <expr>
+
+                let inference = infer_expression_types(db, value_expr);
+                let expr_scope = value_expr.scope(db);
+                let inferred_ty = inference
+                    .expression_type(value_expr.node_ref(db).scoped_expression_id(db, expr_scope));
+
+                union_of_inferred_types = union_of_inferred_types.add(inferred_ty);
+            }
+        }
+
+        Some(union_of_inferred_types.build())
     }
 
     /// A helper function for `instance_member` that looks up the `name` attribute only on
@@ -4148,6 +4193,7 @@ impl<'db> Class<'db> {
         // - The descriptor protocol
 
         let body_scope = self.body_scope(db);
+
         let table = symbol_table(db, body_scope);
 
         if let Some(symbol_id) = table.symbol_id_by_name(name) {
@@ -4171,6 +4217,10 @@ impl<'db> Class<'db> {
                     }
                 }
                 Ok(symbol @ SymbolAndQualifiers(Symbol::Unbound, qualifiers)) => {
+                    if let Some(ty) = Self::implicit_instance_attribute(db, body_scope, name) {
+                        return ty.into();
+                    }
+
                     let bindings = use_def.public_bindings(symbol_id);
                     let inferred = symbol_from_bindings(db, bindings);
 
@@ -4185,6 +4235,10 @@ impl<'db> Class<'db> {
                 }
             }
         } else {
+            if let Some(ty) = Self::implicit_instance_attribute(db, body_scope, name) {
+                return ty.into();
+            }
+
             Symbol::Unbound.into()
         }
     }

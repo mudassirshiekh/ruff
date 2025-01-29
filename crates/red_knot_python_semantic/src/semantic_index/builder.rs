@@ -14,6 +14,7 @@ use crate::ast_node_ref::AstNodeRef;
 use crate::module_name::ModuleName;
 use crate::semantic_index::ast_ids::node_key::ExpressionNodeKey;
 use crate::semantic_index::ast_ids::AstIdsBuilder;
+use crate::semantic_index::attribute_assignment::AttributeAssignment;
 use crate::semantic_index::constraint::PatternConstraintKind;
 use crate::semantic_index::definition::{
     AssignmentDefinitionNodeRef, ComprehensionDefinitionNodeRef, Definition, DefinitionNodeKey,
@@ -53,17 +54,26 @@ impl LoopState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum BuilderScopeKind {
+    ClassBody,
+    FunctionBody,
+    Other,
+}
+
 pub(super) struct SemanticIndexBuilder<'db> {
     // Builder state
     db: &'db dyn Db,
     file: File,
     module: &'db ParsedModule,
-    scope_stack: Vec<(FileScopeId, LoopState)>,
+    scope_stack: Vec<(FileScopeId, LoopState, BuilderScopeKind)>,
     /// The assignments we're currently visiting, with
     /// the most recent visit at the end of the Vec
     current_assignments: Vec<CurrentAssignment<'db>>,
     /// The match case we're currently visiting.
     current_match_case: Option<CurrentMatchCase<'db>>,
+    /// The name of the first function parameter of the innermost function that we're currently visiting.
+    current_first_parameter_name: Option<Name>,
 
     /// Flow states at each `break` in the current loop.
     loop_break_states: Vec<FlowSnapshot>,
@@ -84,6 +94,7 @@ pub(super) struct SemanticIndexBuilder<'db> {
     definitions_by_node: FxHashMap<DefinitionNodeKey, Definition<'db>>,
     expressions_by_node: FxHashMap<ExpressionNodeKey, Expression<'db>>,
     imported_modules: FxHashSet<ModuleName>,
+    attribute_assignments: FxHashMap<FileScopeId, FxHashMap<String, Vec<AttributeAssignment<'db>>>>,
 }
 
 impl<'db> SemanticIndexBuilder<'db> {
@@ -95,6 +106,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             scope_stack: Vec::new(),
             current_assignments: vec![],
             current_match_case: None,
+            current_first_parameter_name: None,
             loop_break_states: vec![],
             try_node_context_stack_manager: TryNodeContextStackManager::default(),
 
@@ -112,6 +124,8 @@ impl<'db> SemanticIndexBuilder<'db> {
             expressions_by_node: FxHashMap::default(),
 
             imported_modules: FxHashSet::default(),
+
+            attribute_assignments: FxHashMap::default(),
         };
 
         builder.push_scope_with_parent(NodeWithScopeRef::Module, None);
@@ -123,7 +137,7 @@ impl<'db> SemanticIndexBuilder<'db> {
         *self
             .scope_stack
             .last()
-            .map(|(scope, _)| scope)
+            .map(|(scope, _, _)| scope)
             .expect("Always to have a root scope")
     }
 
@@ -132,6 +146,26 @@ impl<'db> SemanticIndexBuilder<'db> {
             .last()
             .expect("Always to have a root scope")
             .1
+    }
+
+    fn current_scope_is_function_body(&self) -> bool {
+        matches!(
+            self.scope_stack
+                .last()
+                .expect("Always to have a root scope")
+                .2,
+            BuilderScopeKind::FunctionBody
+        )
+    }
+
+    fn parent_class_body_scope(&self) -> Option<FileScopeId> {
+        if let Some((class_body_id, _, BuilderScopeKind::ClassBody)) =
+            self.scope_stack.iter().nth_back(1)
+        {
+            Some(*class_body_id)
+        } else {
+            None
+        }
     }
 
     fn set_inside_loop(&mut self, state: LoopState) {
@@ -171,11 +205,18 @@ impl<'db> SemanticIndexBuilder<'db> {
 
         debug_assert_eq!(ast_id_scope, file_scope_id);
 
-        self.scope_stack.push((file_scope_id, LoopState::NotInLoop));
+        let scope_kind = match node {
+            NodeWithScopeRef::Class(_) => BuilderScopeKind::ClassBody,
+            NodeWithScopeRef::Function(_) => BuilderScopeKind::FunctionBody,
+            _ => BuilderScopeKind::Other,
+        };
+
+        self.scope_stack
+            .push((file_scope_id, LoopState::NotInLoop, scope_kind));
     }
 
     fn pop_scope(&mut self) -> FileScopeId {
-        let (id, _) = self.scope_stack.pop().expect("Root scope to be present");
+        let (id, _, _) = self.scope_stack.pop().expect("Root scope to be present");
         let children_end = self.scopes.next_index();
         let scope = &mut self.scopes[id];
         scope.descendents = scope.descendents.start..children_end;
@@ -457,6 +498,18 @@ impl<'db> SemanticIndexBuilder<'db> {
     /// Record an expression that needs to be a Salsa ingredient, because we need to infer its type
     /// standalone (type narrowing tests, RHS of an assignment.)
     fn add_standalone_expression(&mut self, expression_node: &ast::Expr) -> Expression<'db> {
+        self.add_standalone_expression_impl(expression_node, false)
+    }
+
+    fn add_standalone_type_expression(&mut self, expression_node: &ast::Expr) -> Expression<'db> {
+        self.add_standalone_expression_impl(expression_node, true)
+    }
+
+    fn add_standalone_expression_impl(
+        &mut self,
+        expression_node: &ast::Expr,
+        infer_as_type_expression: bool,
+    ) -> Expression<'db> {
         let expression = Expression::new(
             self.db,
             self.file,
@@ -465,6 +518,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             unsafe {
                 AstNodeRef::new(self.module.clone(), expression_node)
             },
+            infer_as_type_expression,
             countme::Count::default(),
         );
         self.expressions_by_node
@@ -668,6 +722,7 @@ impl<'db> SemanticIndexBuilder<'db> {
             use_def_maps,
             imported_modules: Arc::new(self.imported_modules),
             has_future_annotations: self.has_future_annotations,
+            attribute_assignments: self.attribute_assignments,
         }
     }
 }
@@ -706,7 +761,17 @@ where
 
                         builder.declare_parameters(parameters);
 
+                        let mut first_parameter_name = parameters
+                            .iter_non_variadic_params()
+                            .next()
+                            .map(|first_param| first_param.parameter.name.id().clone());
+                        std::mem::swap(
+                            &mut builder.current_first_parameter_name,
+                            &mut first_parameter_name,
+                        );
                         builder.visit_body(body);
+                        builder.current_first_parameter_name = first_parameter_name;
+
                         builder.pop_scope()
                     },
                 );
@@ -840,6 +905,33 @@ where
                             unpack: None,
                             first: false,
                         }),
+                        ast::Expr::Attribute(ast::ExprAttribute {
+                            value: object,
+                            attr,
+                            ..
+                        }) => {
+                            if let Some(class_body_scope) = self.parent_class_body_scope() {
+                                if object.as_name_expr().as_ref().is_some_and(|name| {
+                                    Some(&name.id) == self.current_first_parameter_name.as_ref()
+                                }) && self.current_scope_is_function_body()
+                                {
+                                    self.attribute_assignments
+                                        .entry(class_body_scope)
+                                        .or_default()
+                                        .entry(attr.id().as_str().to_owned())
+                                        .or_default()
+                                        .push(AttributeAssignment::new(
+                                            self.db,
+                                            self.file,
+                                            None,
+                                            Some(value),
+                                            countme::Count::default(),
+                                        ));
+                                }
+                            }
+
+                            None
+                        }
                         _ => None,
                     };
 
@@ -858,6 +950,7 @@ where
             ast::Stmt::AnnAssign(node) => {
                 debug_assert_eq!(&self.current_assignments, &[]);
                 self.visit_expr(&node.annotation);
+                let annotation_expr = self.add_standalone_type_expression(&node.annotation);
                 if let Some(value) = &node.value {
                     self.visit_expr(value);
                 }
@@ -869,6 +962,34 @@ where
                 ) {
                     self.push_assignment(node.into());
                     self.visit_expr(&node.target);
+
+                    if let Some(class_body_scope) = self.parent_class_body_scope() {
+                        if let ast::Expr::Attribute(ast::ExprAttribute {
+                            value: object,
+                            attr,
+                            ..
+                        }) = &*node.target
+                        {
+                            if object.as_name_expr().as_ref().is_some_and(|name| {
+                                Some(&name.id) == self.current_first_parameter_name.as_ref()
+                            }) && self.current_scope_is_function_body()
+                            {
+                                self.attribute_assignments
+                                    .entry(class_body_scope)
+                                    .or_default()
+                                    .entry(attr.id().as_str().to_owned())
+                                    .or_default()
+                                    .push(AttributeAssignment::new(
+                                        self.db,
+                                        self.file,
+                                        Some(annotation_expr),
+                                        None,
+                                        countme::Count::default(),
+                                    ));
+                            }
+                        }
+                    }
+
                     self.pop_assignment();
                 } else {
                     self.visit_expr(&node.target);

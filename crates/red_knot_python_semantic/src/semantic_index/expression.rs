@@ -35,6 +35,9 @@ pub(crate) struct Expression<'db> {
     #[return_ref]
     pub(crate) node_ref: AstNodeRef<ast::Expr>,
 
+    #[id]
+    pub(crate) infer_as_type_expression: bool,
+
     #[no_eq]
     count: countme::Count<Expression<'static>>,
 }

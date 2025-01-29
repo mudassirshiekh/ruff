@@ -25,25 +25,21 @@ class C:
 
 c_instance = C(1)
 
-# TODO: Mypy/pyright infer `int | str` here. We want this to be `Unknown | Literal[1, "a"]`
-reveal_type(c_instance.inferred_from_value)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.inferred_from_value)  # revealed: Unknown | Literal[1, "a"]
 
 # TODO: Same here. This should be `Unknown | Literal[1, "a"]`
-reveal_type(c_instance.inferred_from_other_attribute)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.inferred_from_other_attribute)  # revealed: Unknown
 
 # TODO: should be `int | None`
-reveal_type(c_instance.inferred_from_param)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.inferred_from_param)  # revealed: Unknown | int | None
 
-# TODO: should be `bytes`
-reveal_type(c_instance.declared_only)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.declared_only)  # revealed: bytes
 
-# TODO: should be `bool`
-reveal_type(c_instance.declared_and_bound)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.declared_and_bound)  # revealed: bool
 
-# TODO: should be `str`
 # We probably don't want to emit a diagnostic for this being possibly undeclared/unbound.
 # mypy and pyright do not show an error here.
-reveal_type(c_instance.possibly_undeclared_unbound)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.possibly_undeclared_unbound)  # revealed: str
 
 # This assignment is fine, as we infer `Unknown | Literal[1, "a"]` for `inferred_from_value`.
 c_instance.inferred_from_value = "value set on instance"
@@ -71,7 +67,7 @@ c_instance.declared_and_bound = False
 # in general (we don't know what else happened to `c_instance` between the assignment and the use
 # here), but mypy and pyright support this. In conclusion, this could be `bool` but should probably
 # be `Literal[False]`.
-reveal_type(c_instance.declared_and_bound)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.declared_and_bound)  # revealed: bool
 ```
 
 #### Variable declared in class body and possibly bound in `__init__`
@@ -124,7 +120,7 @@ reveal_type(C.only_declared)  # revealed: str
 C.only_declared = "overwritten on class"
 ```
 
-#### Variable only defined in unrelated method
+#### Variable defined in non-`__init__` method
 
 We also recognize pure instance variables if they are defined in a method that is not `__init__`.
 
@@ -143,20 +139,17 @@ class C:
 
 c_instance = C(1)
 
-# TODO: Should be `Unknown | Literal[1, "a"]`
-reveal_type(c_instance.inferred_from_value)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.inferred_from_value)  # revealed: Unknown | Literal[1, "a"]
 
 # TODO: Should be `Unknown | Literal[1, "a"]`
-reveal_type(c_instance.inferred_from_other_attribute)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.inferred_from_other_attribute)  # revealed: Unknown
 
 # TODO: Should be `int | None`
-reveal_type(c_instance.inferred_from_param)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.inferred_from_param)  # revealed: Unknown | int | None
 
-# TODO: Should be `bytes`
-reveal_type(c_instance.declared_only)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.declared_only)  # revealed: bytes
 
-# TODO: Should be `bool`
-reveal_type(c_instance.declared_and_bound)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.declared_and_bound)  # revealed: bool
 
 # TODO: We already show an error here, but the message might be improved?
 # error: [unresolved-attribute]
@@ -164,6 +157,83 @@ reveal_type(C.inferred_from_value)  # revealed: Unknown
 
 # TODO: this should be an error
 C.inferred_from_value = "overwritten on class"
+```
+
+#### Variable defined in multiple methods
+
+If we see multiple un-annotated assignments to a single attribute (`self.x` below), we build the
+union of all inferred types (and `Unknown`). If we see multiple conflicting declarations of the same
+attribute, that should be an error.
+
+```py
+def get_int() -> int:
+    return 0
+
+def get_str() -> str:
+    return "a"
+
+class C:
+    def __init__(self) -> None:
+        self.x = get_int()
+        self.y: int = 1
+
+    def other_method(self):
+        self.x = get_str()
+
+        # TODO: this redeclaration should be an error
+        self.y: str = "a"
+
+c_instance = C()
+
+reveal_type(c_instance.x)  # revealed: Unknown | int | str
+
+# TODO: We should probably infer `int | str` here.
+reveal_type(c_instance.y)  # revealed: int
+```
+
+#### Attributes defined in tuple unpackings
+
+```py
+class C:
+    def __init__(self) -> None:
+        self.x, self.y = (1, "a")
+
+c_instance = C()
+
+# TODO: This should be supported (no error; type should be: `Unknown | Literal[1]`)
+# error: [unresolved-attribute]
+reveal_type(c_instance.x)  # revealed: Unknown
+
+# TODO: This should be supported (no error; type should be: `Unknown | Literal["a"]`)
+# error: [unresolved-attribute]
+reveal_type(c_instance.y)  # revealed: Unknown
+```
+
+#### Conditionally declared / bound attributes
+
+We currently do not raise a diagnostic or change behavior if an attribute is only conditionally
+defined. This is consistent with what mypy and pyright do.
+
+```py
+def flag() -> bool:
+    return True
+
+class C:
+    def f(self) -> None:
+        if flag():
+            self.a1: str | None = "a"
+            self.b1 = 1
+    if flag():
+        def f(self) -> None:
+            self.a2: str | None = "a"
+            self.b2 = 1
+
+c_instance = C()
+
+reveal_type(c_instance.a1)  # revealed: str | None
+reveal_type(c_instance.a2)  # revealed: str | None
+reveal_type(c_instance.b1)  # revealed: Unknown | Literal[1]
+reveal_type(c_instance.b2)  # revealed: Unknown | Literal[1]
 ```
 
 #### Methods that does not use `self` as a first parameter
@@ -175,8 +245,7 @@ class C:
     def __init__(this) -> None:
         this.declared_and_bound: str | None = "a"
 
-# TODO: should be `str | None`
-reveal_type(C().declared_and_bound)  # revealed: @Todo(implicit instance attribute)
+reveal_type(C().declared_and_bound)  # revealed: str | None
 ```
 
 #### Aliased `self` parameter
@@ -187,9 +256,10 @@ class C:
         this = self
         this.declared_and_bound: str | None = "a"
 
-# TODO: This would ideally be `str | None`, but mypy/pyright don't support this either,
+# This would ideally be `str | None`, but mypy/pyright don't support this either,
 # so `Unknown` + a diagnostic is also fine.
-reveal_type(C().declared_and_bound)  # revealed: @Todo(implicit instance attribute)
+# error: [unresolved-attribute]
+reveal_type(C().declared_and_bound)  # revealed: Unknown
 ```
 
 ### Pure class variables (`ClassVar`)
@@ -266,7 +336,7 @@ reveal_type(C.pure_class_variable)  # revealed: Unknown
 
 c_instance = C()
 # TODO: should be `Literal["overwritten on class"]`
-reveal_type(c_instance.pure_class_variable)  # revealed: @Todo(implicit instance attribute)
+reveal_type(c_instance.pure_class_variable)  # revealed: Unknown | Literal["value set in class method"]
 
 # TODO: should raise an error.
 c_instance.pure_class_variable = "value set on instance"
@@ -360,8 +430,7 @@ reveal_type(Derived.declared_in_body)  # revealed: int | None
 
 reveal_type(Derived().declared_in_body)  # revealed: int | None
 
-# TODO: Should be `str | None`
-reveal_type(Derived().defined_in_init)  # revealed: @Todo(implicit instance attribute)
+reveal_type(Derived().defined_in_init)  # revealed: str | None
 ```
 
 ## Union of attributes
@@ -644,6 +713,65 @@ All attribute access on literal `bytes` types is currently delegated to `buitins
 ```py
 reveal_type(b"foo".join)  # revealed: @Todo(bound method)
 reveal_type(b"foo".endswith)  # revealed: @Todo(bound method)
+```
+
+## Instance attribute edge cases
+
+### Assignment to attribute that does not correspond to the instance
+
+```py
+class C:
+    def __init__(self, other: "C") -> None:
+        other.x: str = 1
+
+def f(c: C):
+    # error: [unresolved-attribute]
+    reveal_type(c.x)  # revealed: Unknown
+```
+
+### Nested classes
+
+```py
+class Outer:
+    def __init__(self):
+        self.x: int = 1
+
+    class Inner:
+        def __init__(self):
+            self.x: str = "a"
+
+reveal_type(Outer().x)  # revealed: int
+reveal_type(Outer.Inner().x)  # revealed: str
+```
+
+### Shadowing of `self`
+
+```py
+class Other:
+    x: int = 1
+
+class C:
+    def __init__(self) -> None:
+        # Weird redeclaration of self
+        self: Other = Other()
+        self.x: int = 1
+
+# TODO: this should be an error
+C().x
+```
+
+### Assignment to `self` from nested function
+
+```py
+class C:
+    def __init__(self) -> None:
+        def set_attribute(value: str):
+            self.x: str = value
+        set_attribute("a")
+
+# TODO: ideally, this would be `str`. Mypy supports this, pyright does not.
+# error: [unresolved-attribute]
+reveal_type(C().x)  # revealed: Unknown
 ```
 
 ## References
